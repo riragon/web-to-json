@@ -1,20 +1,20 @@
-use actix_files::NamedFile;
 use actix_web::{
-    http::header::{ContentDisposition, DispositionParam, DispositionType},
-    web, App, HttpResponse, HttpServer, Responder, Result,
+    http::header::ContentType,
+    web, App, HttpResponse, HttpServer, Responder,
 };
 use scraper::{ElementRef, Html, Node, Selector};
 use serde::{Deserialize, Serialize};
+use std::env;
 use std::fs::File;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::task::spawn;
 use open;
 use regex::Regex;
 use url::Url;
 use sanitize_filename::sanitize;
 
-/// フォームで受け取る
+/// フォームで受け取るデータ
 #[derive(Deserialize)]
 struct UrlForm {
     url: String,
@@ -37,7 +37,7 @@ struct DomNode {
     children: Vec<DomNode>,
 }
 
-/// 必要なタグだけ残す (h1-h6, p, ul, ol, li, aなど)
+/// 対象とするタグかどうかを判定 (h1-h6, p, ul, ol, li, aなど)
 fn is_target_tag(tag_name: &str) -> bool {
     matches!(
         tag_name,
@@ -48,18 +48,15 @@ fn is_target_tag(tag_name: &str) -> bool {
     )
 }
 
-/// テキストから `\n` をスペースへ置換し、連続空白をまとめる
+/// テキストから改行をスペースにし、連続空白をまとめる
 fn clean_text(raw: &str) -> String {
-    // 改行をスペースに
     let replaced = raw.replace('\n', " ");
-    // 正規表現で連続空白を1つに
     let re = Regex::new(r"\s+").unwrap();
     let single_spaced = re.replace_all(&replaced, " ");
-    // 前後をtrim
     single_spaced.trim().to_string()
 }
 
-/// 再帰的に子ノードを解析
+/// 再帰的に子ノードを解析 → Vec<DomNode>
 fn parse_element_rec(el: ElementRef) -> Vec<DomNode> {
     let evalue = el.value();
     let tag_name = evalue.name().to_lowercase();
@@ -88,7 +85,7 @@ fn parse_element_rec(el: ElementRef) -> Vec<DomNode> {
         }
     }
 
-    // ホワイトリストタグなら DomNode を生成
+    // 対象タグならDomNode生成、そうでなければ子どもだけを返す
     if is_target_tag(&tag_name) {
         let mut link = None;
         if tag_name == "a" {
@@ -105,12 +102,11 @@ fn parse_element_rec(el: ElementRef) -> Vec<DomNode> {
             children: children_nodes,
         }]
     } else {
-        // スキップ対象タグは自分を作らず、子だけ返す
         children_nodes
     }
 }
 
-/// HTML全体をパース → DomNode
+/// HTML文字列をパースして DomNode を構築
 fn parse_html_dom(html_str: &str) -> DomNode {
     let doc = Html::parse_document(html_str);
     let sel_html = Selector::parse("html").unwrap();
@@ -133,98 +129,104 @@ fn parse_html_dom(html_str: &str) -> DomNode {
     }
 }
 
-/// URL末尾パス要素 (例: rccmd.htm)
+/// URL の末尾パス要素を取得 (例: "apinode.htm" など)
 fn get_last_path_segment(url_str: &str) -> Option<String> {
     let parsed = Url::parse(url_str).ok()?;
     let mut segments = parsed.path_segments()?;
     segments.next_back().map(|s| s.to_string())
 }
 
-/// トップ: URL入力フォーム & ダウンロードボタン
-async fn index() -> impl Responder {
+/// (GET) フォーム表示
+async fn show_form() -> impl Responder {
     let html = r#"
 <!DOCTYPE html>
 <html><head><meta charset="UTF-8"/><title>Web to JSON</title></head>
 <body>
  <h1>URLを入力</h1>
- <form action="/convert" method="post">
+ <form action="/" method="post">
    <input type="text" name="url" size="50"/>
    <button type="submit">JSON変換</button>
  </form>
- <hr/>
- <button onclick="location.href='/download'">JSONファイルを保存</button>
 </body></html>
     "#;
-    HttpResponse::Ok().content_type("text/html; charset=utf-8").body(html)
+
+    HttpResponse::Ok()
+        .content_type(ContentType::html())
+        .body(html)
 }
 
-/// HTML→DomNode→1行JSON → ファイル保存
-async fn convert(form: web::Form<UrlForm>) -> impl Responder {
+/// (POST) 同ページでフォーム→JSON化→結果表示
+async fn process_form(form: web::Form<UrlForm>) -> impl Responder {
     let url_str = &form.url;
 
-    // ページ取得
+    // 1. 指定URLのHTMLを取得
     let body = match reqwest::get(url_str).await {
         Ok(resp) => match resp.text().await {
             Ok(text) => text,
-            Err(e) => return HttpResponse::InternalServerError().body(format!("Error reading: {e}")),
+            Err(e) => {
+                return HttpResponse::InternalServerError().body(format!("Error reading response: {e}"));
+            }
         },
-        Err(e) => return HttpResponse::InternalServerError().body(format!("Request error: {e}")),
+        Err(e) => {
+            return HttpResponse::InternalServerError().body(format!("Request error: {e}"));
+        }
     };
 
-    // ドメイン
+    // 2. 保存用ファイル名
     let domain = Url::parse(url_str)
         .ok()
         .and_then(|u| u.host_str().map(|s| s.to_string()))
-        .unwrap_or_else(|| "nodomain".into());
+        .unwrap_or_else(|| "nodomain".to_string());
 
-    // 末尾パス要素
-    let last_seg = get_last_path_segment(url_str).unwrap_or_else(|| "nopath".into());
+    let last_seg = get_last_path_segment(url_str).unwrap_or_else(|| "nopath".to_string());
+    let filename_part = sanitize(format!("{}_{}", domain, last_seg)); // 例: "rchelp.capturingreality.com_apinode.htm"
+    let file_name = format!("{filename_part}.json"); // 例: "rchelp.capturingreality.com_apinode.htm.json"
 
-    // ファイル名 "domain_lastseg.json"
-    let filename_part = sanitize(format!("{}_{}", domain, last_seg));
-    let file_name = format!("{filename_part}.json");
-
-    // HTMLパース
+    // 3. HTMLをDomNodeにパース → JSON化(1行)
     let dom_tree = parse_html_dom(&body);
-
-    // **ここがポイント** : 1行JSONにする
     let json = match serde_json::to_string(&dom_tree) {
         Ok(j) => j,
-        Err(e) => return HttpResponse::InternalServerError().body(format!("JSON error: {e}")),
+        Err(e) => {
+            return HttpResponse::InternalServerError().body(format!("JSON error: {e}"));
+        }
     };
 
-    // ファイル保存
-    match File::create(&file_name) {
+    // 4. exeファイルと同じフォルダに出力する
+    let exe_path = env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
+    let exe_dir = exe_path.parent().unwrap_or_else(|| Path::new("."));
+    let file_path = exe_dir.join(&file_name);
+
+    match File::create(&file_path) {
         Ok(mut f) => {
             if let Err(e) = f.write_all(json.as_bytes()) {
                 return HttpResponse::InternalServerError().body(format!("Write error: {e}"));
             }
         }
-        Err(e) => return HttpResponse::InternalServerError().body(format!("Create file error: {e}")),
+        Err(e) => {
+            return HttpResponse::InternalServerError().body(format!("Create file error: {e}"));
+        }
     }
 
-    // 結果表示
-    let msg = format!(
+    // 5. 成功メッセージを同じページに表示
+    let response_html = format!(
         r#"
-        <html><body>
-          <h2>"{url_str}" → "{file_name}" に保存しました (1行JSON)</h2>
-          <p><a href="/">別のURLを変換する</a></p>
-        </body></html>
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"/><title>Web to JSON</title></head>
+<body>
+  <h1>URLを入力</h1>
+  <form action="/" method="post">
+    <input type="text" name="url" size="50"/>
+    <button type="submit">JSON変換</button>
+  </form>
+  <hr/>
+  <p>"{url_str}" → "{file_name}" に保存しました (1行JSON)</p>
+</body></html>
         "#
     );
-    HttpResponse::Ok().content_type("text/html; charset=utf-8").body(msg)
-}
 
-/// ダウンロード: 常に "webpage_data.json" を返す例
-async fn download_file() -> Result<NamedFile> {
-    let path: PathBuf = PathBuf::from("webpage_data.json");
-    let file = NamedFile::open(path)?;
-    Ok(file.set_content_disposition(ContentDisposition {
-        disposition: DispositionType::Attachment,
-        parameters: vec![DispositionParam::Filename(
-            "webpage_data.json".to_owned(),
-        )],
-    }))
+    HttpResponse::Ok()
+        .content_type(ContentType::html())
+        .body(response_html)
 }
 
 /// メイン関数
@@ -232,14 +234,15 @@ async fn download_file() -> Result<NamedFile> {
 async fn main() -> std::io::Result<()> {
     let server = HttpServer::new(|| {
         App::new()
-            .route("/", web::get().to(index))
-            .route("/convert", web::post().to(convert))
-            .route("/download", web::get().to(download_file))
+            // GET / : フォーム表示
+            .route("/", web::get().to(show_form))
+            // POST / : 同じURLで処理・結果表示
+            .route("/", web::post().to(process_form))
     })
     .bind(("127.0.0.1", 8080))?
     .run();
 
-    // サーバ起動後にブラウザを自動起動
+    // サーバ起動後にブラウザを自動で開く
     spawn(async {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         let _ = open::that("http://127.0.0.1:8080/");

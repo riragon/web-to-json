@@ -1,27 +1,27 @@
 use actix_web::{
-    http::header::ContentType,
     web, App, HttpResponse, HttpServer, Responder,
 };
-use scraper::{ElementRef, Html, Node, Selector};
-use serde::{Deserialize, Serialize};
-use std::env;
-use std::fs::File;
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use tokio::task::spawn;
-use open;
+use serde::{Serialize, Deserialize};
 use regex::Regex;
+use tokio::task::{spawn, spawn_blocking};
+use std::time::Duration;
+use open;
 use url::Url;
+
+// ここを正しく修正
 use sanitize_filename::sanitize;
 
-/// フォームで受け取るデータ
+// scraper で必要な型まとめ
+use scraper::{Html, Selector, ElementRef, Node};
+
+/// フォーム入力用
 #[derive(Deserialize)]
 struct UrlForm {
     url: String,
 }
 
-/// JSON出力用のデータ構造
-#[derive(Serialize, Debug)]
+/// JSON 出力用データ (DOMツリー + 1階層リンク先)
+#[derive(Debug, Serialize)]
 struct DomNode {
     #[serde(skip_serializing_if = "Option::is_none")]
     tag: Option<String>,
@@ -35,105 +35,9 @@ struct DomNode {
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     children: Vec<DomNode>,
-}
 
-/// 対象とするタグかどうかを判定 (h1-h6, p, ul, ol, li, aなど)
-fn is_target_tag(tag_name: &str) -> bool {
-    matches!(
-        tag_name,
-        "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
-            | "p"
-            | "ul" | "ol" | "li"
-            | "a"
-    )
-}
-
-/// テキストから改行をスペースにし、連続空白をまとめる
-fn clean_text(raw: &str) -> String {
-    let replaced = raw.replace('\n', " ");
-    let re = Regex::new(r"\s+").unwrap();
-    let single_spaced = re.replace_all(&replaced, " ");
-    single_spaced.trim().to_string()
-}
-
-/// 再帰的に子ノードを解析 → Vec<DomNode>
-fn parse_element_rec(el: ElementRef) -> Vec<DomNode> {
-    let evalue = el.value();
-    let tag_name = evalue.name().to_lowercase();
-
-    let mut children_nodes = vec![];
-    for child in el.children() {
-        match child.value() {
-            Node::Element(_) => {
-                if let Some(child_el) = ElementRef::wrap(child) {
-                    let mut sub = parse_element_rec(child_el);
-                    children_nodes.append(&mut sub);
-                }
-            }
-            Node::Text(txt) => {
-                let cleaned = clean_text(txt);
-                if !cleaned.is_empty() {
-                    children_nodes.push(DomNode {
-                        tag: None,
-                        href: None,
-                        text: Some(cleaned),
-                        children: vec![],
-                    });
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // 対象タグならDomNode生成、そうでなければ子どもだけを返す
-    if is_target_tag(&tag_name) {
-        let mut link = None;
-        if tag_name == "a" {
-            for (attr_name, attr_value) in evalue.attrs() {
-                if attr_name.eq_ignore_ascii_case("href") {
-                    link = Some(attr_value.to_string());
-                }
-            }
-        }
-        vec![DomNode {
-            tag: Some(tag_name),
-            href: link,
-            text: None,
-            children: children_nodes,
-        }]
-    } else {
-        children_nodes
-    }
-}
-
-/// HTML文字列をパースして DomNode を構築
-fn parse_html_dom(html_str: &str) -> DomNode {
-    let doc = Html::parse_document(html_str);
-    let sel_html = Selector::parse("html").unwrap();
-
-    if let Some(html_el) = doc.select(&sel_html).next() {
-        let kids = parse_element_rec(html_el);
-        DomNode {
-            tag: Some("html".to_string()),
-            href: None,
-            text: None,
-            children: kids,
-        }
-    } else {
-        DomNode {
-            tag: Some("html".to_string()),
-            href: None,
-            text: Some("(No <html> found)".to_string()),
-            children: vec![],
-        }
-    }
-}
-
-/// URL の末尾パス要素を取得 (例: "apinode.htm" など)
-fn get_last_path_segment(url_str: &str) -> Option<String> {
-    let parsed = Url::parse(url_str).ok()?;
-    let mut segments = parsed.path_segments()?;
-    segments.next_back().map(|s| s.to_string())
+    #[serde(skip_serializing_if = "Option::is_none")]
+    link_subpage: Option<Box<DomNode>>,
 }
 
 /// (GET) フォーム表示
@@ -151,102 +55,281 @@ async fn show_form() -> impl Responder {
     "#;
 
     HttpResponse::Ok()
-        .content_type(ContentType::html())
+        .content_type("text/html; charset=utf-8")
         .body(html)
 }
 
-/// (POST) 同ページでフォーム→JSON化→結果表示
+/// (POST) URLを受け取り → HTML を同期パース → 1階層リンク先も解析 → JSONを1行で表示
+/// ブラウザでダウンロード（Blob方式）＆テキストコピー
 async fn process_form(form: web::Form<UrlForm>) -> impl Responder {
     let url_str = &form.url;
 
-    // 1. 指定URLのHTMLを取得
-    let body = match reqwest::get(url_str).await {
+    // 1. URLをパース
+    let parsed_url = match Url::parse(url_str) {
+        Ok(u) => u,
+        Err(e) => {
+            return HttpResponse::BadRequest().body(format!("URL parse error: {e}"));
+        }
+    };
+
+    // 2. HTTP GET (非同期)
+    let main_html = match reqwest::get(parsed_url.clone()).await {
         Ok(resp) => match resp.text().await {
-            Ok(text) => text,
+            Ok(body) => body,
             Err(e) => {
-                return HttpResponse::InternalServerError().body(format!("Error reading response: {e}"));
+                return HttpResponse::InternalServerError()
+                    .body(format!("Error reading response: {e}"));
             }
         },
         Err(e) => {
-            return HttpResponse::InternalServerError().body(format!("Request error: {e}"));
+            return HttpResponse::InternalServerError()
+                .body(format!("Request error: {e}"));
         }
     };
 
-    // 2. 保存用ファイル名
-    let domain = Url::parse(url_str)
-        .ok()
-        .and_then(|u| u.host_str().map(|s| s.to_string()))
-        .unwrap_or_else(|| "nodomain".to_string());
-
-    let last_seg = get_last_path_segment(url_str).unwrap_or_else(|| "nopath".to_string());
-    let filename_part = sanitize(format!("{}_{}", domain, last_seg)); // 例: "rchelp.capturingreality.com_apinode.htm"
-    let file_name = format!("{filename_part}.json"); // 例: "rchelp.capturingreality.com_apinode.htm.json"
-
-    // 3. HTMLをDomNodeにパース → JSON化(1行)
-    let dom_tree = parse_html_dom(&body);
-    let json = match serde_json::to_string(&dom_tree) {
-        Ok(j) => j,
+    // 3. 同期パース (spawn_blocking)
+    let mut dom_tree = match spawn_blocking(move || parse_html_sync(&main_html)).await {
+        Ok(tree) => tree,
         Err(e) => {
-            return HttpResponse::InternalServerError().body(format!("JSON error: {e}"));
+            return HttpResponse::InternalServerError()
+                .body(format!("spawn_blocking error: {e:?}"));
         }
     };
 
-    // 4. exeファイルと同じフォルダに出力する
-    let exe_path = env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
-    let exe_dir = exe_path.parent().unwrap_or_else(|| Path::new("."));
-    let file_path = exe_dir.join(&file_name);
-
-    match File::create(&file_path) {
-        Ok(mut f) => {
-            if let Err(e) = f.write_all(json.as_bytes()) {
-                return HttpResponse::InternalServerError().body(format!("Write error: {e}"));
-            }
-        }
-        Err(e) => {
-            return HttpResponse::InternalServerError().body(format!("Create file error: {e}"));
-        }
+    // 4. 1階層リンク先を取得 (BFS + spawn_blocking)
+    if let Err(e) = fetch_subpages_for_depth_one(&mut dom_tree, &parsed_url).await {
+        return HttpResponse::InternalServerError()
+            .body(format!("Subpage fetch error: {e}"));
     }
 
-    // 5. 成功メッセージを同じページに表示
+    // 5. JSON を1行でシリアライズ
+    let json_str = match serde_json::to_string(&dom_tree) {
+        Ok(j) => j,  // ← 1行の JSON
+        Err(e) => {
+            return HttpResponse::InternalServerError()
+                .body(format!("JSON serialize error: {e}"));
+        }
+    };
+
+    // 6. ファイル名 (ダウンロード用)
+    let domain = parsed_url.host_str().unwrap_or("nodomain").to_string();
+    let file_name = format!("{}_{}.json",
+        sanitize(domain),
+        get_last_path_segment(url_str).unwrap_or_else(|| "nopath".to_string())
+    );
+
+    // 7. テキスト表示用にエスケープ
+    let escaped_json = json_str
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+
+    // HTMLレスポンス
     let response_html = format!(
         r#"
 <!DOCTYPE html>
-<html><head><meta charset="UTF-8"/><title>Web to JSON</title></head>
+<html><head><meta charset="UTF-8"/><title>Web to JSON (1line JSON)</title></head>
 <body>
-  <h1>URLを入力</h1>
+  <h1>結果</h1>
+  <p>"{url_str}" を解析し、1階層リンク先を含む JSON (1行) を生成しました。</p>
+
+  <!-- ダウンロード (Blob方式) -->
+  <button onclick="downloadJson()">JSONをダウンロード</button>
+
+  <!-- テキスト表示 & コピー -->
+  <hr/>
+  <h2>JSONテキスト (コピー可, 1行表示)</h2>
+  <textarea id="jsonText" rows="10" cols="90" style="white-space: pre;">{escaped_json}</textarea><br/>
+  <button onclick="copyToClipboard()">コピー</button>
+
+  <script>
+    // ダウンロード: Blob -> createObjectURL -> aタグ.click()
+    function downloadJson() {{
+      const text = `{json_str}`;
+      const blob = new Blob([text], {{ type: 'application/json' }});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = "{file_name}";
+      a.click();
+      URL.revokeObjectURL(url);
+    }}
+
+    // テキストコピー
+    function copyToClipboard() {{
+      const textArea = document.getElementById('jsonText');
+      navigator.clipboard.writeText(textArea.value)
+        .then(() => alert('クリップボードにコピーしました。'))
+        .catch(err => alert('コピー失敗: ' + err));
+    }}
+  </script>
+
+  <hr/>
+  <h2>再度URLを入力</h2>
   <form action="/" method="post">
     <input type="text" name="url" size="50"/>
     <button type="submit">JSON変換</button>
   </form>
-  <hr/>
-  <p>"{url_str}" → "{file_name}" に保存しました (1行JSON)</p>
 </body></html>
-        "#
+        "#,
+        url_str = url_str,
+        json_str = json_str,
+        escaped_json = escaped_json,
+        file_name = file_name
     );
 
     HttpResponse::Ok()
-        .content_type(ContentType::html())
+        .content_type("text/html; charset=utf-8")
         .body(response_html)
 }
 
-/// メイン関数
-#[tokio::main]
+/// メイン関数 (Tokio マルチスレッドランタイム)
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> std::io::Result<()> {
     let server = HttpServer::new(|| {
         App::new()
-            // GET / : フォーム表示
             .route("/", web::get().to(show_form))
-            // POST / : 同じURLで処理・結果表示
             .route("/", web::post().to(process_form))
     })
     .bind(("127.0.0.1", 8080))?
     .run();
 
-    // サーバ起動後にブラウザを自動で開く
+    // 起動後にブラウザを自動で開く
     spawn(async {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
         let _ = open::that("http://127.0.0.1:8080/");
     });
 
     server.await
+}
+
+// ========== 以下：同期パース + BFS ==========
+
+fn parse_html_sync(html_str: &str) -> DomNode {
+    let doc = Html::parse_document(html_str);
+    let sel_html = Selector::parse("html").unwrap();
+    if let Some(html_el) = doc.select(&sel_html).next() {
+        DomNode {
+            tag: Some("html".to_string()),
+            href: None,
+            text: None,
+            children: parse_children(html_el),
+            link_subpage: None,
+        }
+    } else {
+        DomNode {
+            tag: Some("html".to_string()),
+            href: None,
+            text: Some("(No <html> found)".to_string()),
+            children: vec![],
+            link_subpage: None,
+        }
+    }
+}
+
+fn parse_children(el: ElementRef) -> Vec<DomNode> {
+    let mut result = Vec::new();
+    for child in el.children() {
+        match child.value() {
+            Node::Element(ele_val) => {
+                let tag_name = ele_val.name().to_lowercase();
+                if is_target_tag(&tag_name) {
+                    let mut link = None;
+                    if tag_name == "a" {
+                        for (attr_name, attr_value) in ele_val.attrs() {
+                            if attr_name.eq_ignore_ascii_case("href") {
+                                link = Some(attr_value.to_string());
+                            }
+                        }
+                    }
+                    let sub_nodes = parse_children(ElementRef::wrap(child).unwrap());
+                    result.push(DomNode {
+                        tag: Some(tag_name),
+                        href: link,
+                        text: None,
+                        children: sub_nodes,
+                        link_subpage: None,
+                    });
+                } else {
+                    // 対象外タグ -> 子要素だけたどる
+                    let sub = parse_children(ElementRef::wrap(child).unwrap());
+                    result.extend(sub);
+                }
+            }
+            Node::Text(txt) => {
+                let c = clean_text(txt);
+                if !c.is_empty() {
+                    result.push(DomNode {
+                        tag: None,
+                        href: None,
+                        text: Some(c),
+                        children: vec![],
+                        link_subpage: None,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    result
+}
+
+/// イテレーティブ BFS: node.children / <a>タグを探してリンク先を parse_html_sync
+async fn fetch_subpages_for_depth_one(root: &mut DomNode, base_url: &Url) -> Result<(), String> {
+    let mut stack = vec![root as *mut DomNode];
+    while let Some(ptr) = stack.pop() {
+        let node = unsafe { &mut *ptr };
+
+        // 子ノードを追加
+        for child in node.children.iter_mut() {
+            stack.push(child as *mut DomNode);
+        }
+
+        // <a>タグならリンク先を fetch → spawn_blocking で parse
+        if let Some(ref t) = node.tag {
+            if t == "a" {
+                if let Some(ref href) = node.href {
+                    let sub_url = base_url.join(href)
+                        .map_err(|e| e.to_string())?;
+
+                    let body = reqwest::get(sub_url.clone()).await
+                        .map_err(|e| format!("fetch subpage error: {e}"))?
+                        .text().await
+                        .map_err(|e| format!("subpage .text() error: {e}"))?;
+
+                    let subdom = spawn_blocking(move || parse_html_sync(&body))
+                        .await
+                        .map_err(|e| format!("spawn_blocking error: {e:?}"))?;
+
+                    node.link_subpage = Some(Box::new(subdom));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// テキストの改行や連続空白を整形
+fn clean_text(raw: &str) -> String {
+    let replaced = raw.replace('\n', " ");
+    let re = Regex::new(r"\s+").unwrap();
+    re.replace_all(&replaced, " ").trim().to_string()
+}
+
+/// パース対象タグかどうか
+fn is_target_tag(tag_name: &str) -> bool {
+    matches!(
+        tag_name,
+        "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+            | "p"
+            | "ul" | "ol" | "li"
+            | "a"
+    )
+}
+
+/// URLの末尾パス要素 (例: index.html)
+fn get_last_path_segment(url_str: &str) -> Option<String> {
+    let parsed = Url::parse(url_str).ok()?;
+    let mut segments = parsed.path_segments()?;
+    segments.next_back().map(|s| s.to_string())
 }

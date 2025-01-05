@@ -1,2 +1,4 @@
+OUTPUT_PATH=C:\Users\saijo\Desktop
+
 ^Cargo\.toml$
 ^main\.rs$
